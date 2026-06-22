@@ -1,0 +1,8 @@
+{
+  "name": "plan-execute",
+  "version": "0.1.0",
+  "description": "Two-phase plan/execute workflow with model routing",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
