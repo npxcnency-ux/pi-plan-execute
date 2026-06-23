@@ -38,6 +38,7 @@ import {
 	readPlansRegistry,
 	writeExecPending,
 	readAndClearExecPending,
+	clearExecPending,
 	findInProgressPlans,
 	upsertPlanRegistry,
 	planDir,
@@ -96,8 +97,9 @@ export default function planExecute(pi: ExtensionAPI): void {
 		}
 	}
 
+	let lastPersistedKey = "";
 	function persistState(ctx: any): void {
-		pi.appendEntry("plan-execute-state", {
+		const snapshot = {
 			planEnabled: state.planEnabled,
 			executing: state.executing,
 			planDir: state.planDir,
@@ -106,7 +108,13 @@ export default function planExecute(pi: ExtensionAPI): void {
 			executionStartIdx: state.executionStartIdx,
 			previousModel: state.previousModel,
 			previousThinking: state.previousThinking,
-		});
+		};
+		// Skip if nothing changed since last persist — session file is append-only,
+		// avoid duplicate entries piling up turn after turn.
+		const key = JSON.stringify(snapshot);
+		if (key === lastPersistedKey) return;
+		lastPersistedKey = key;
+		pi.appendEntry("plan-execute-state", snapshot);
 	}
 
 	async function pickPlanModel(ctx: any): Promise<ModelDef | null | undefined> {
@@ -639,9 +647,14 @@ export default function planExecute(pi: ExtensionAPI): void {
 				},
 			});
 			if (result?.cancelled) {
+				// User aborted the picker before the new session ran session_start,
+				// so .exec-pending.json is still on disk. Clear it so the next
+				// unrelated session_start doesn't get hijacked.
+				clearExecPending(ctx.cwd);
 				ctx.ui.notify("执行会话创建被取消", "warning");
 			}
 		} catch (err) {
+			clearExecPending(ctx.cwd);
 			ctx.ui.notify(`launchExecSession 失败: ${err instanceof Error ? err.message : String(err)}`, "error");
 		}
 	}
@@ -733,37 +746,84 @@ export default function planExecute(pi: ExtensionAPI): void {
 
 		const blocked = state.plan.tasks.filter((t) => t.status === "blocked");
 		if (blocked.length > 0) {
-			const bs = blocked[0];
-			const info = `Task ${bs.id}: ${bs.description}${bs.notes ? `\n原因: ${bs.notes}` : ""}`;
-			const choice = await ctx.ui.select(`任务阻塞 — ${info}\n\n下一步?`, [
-				"跳过此任务",
-				"提供补充说明后重试",
-				"切回主会话重新规划",
-				"中止执行",
-			]);
+			// Loop through every blocked task in one menu pass — otherwise the
+			// executor has to spin a full LLM turn between each blocked task
+			// just to land back here.
+			const retryInstructions: string[] = [];
+			let skipCount = 0;
+			let aborted = false;
+			let returnedToParent = false;
 
-			if (choice === "跳过此任务") {
-				bs.status = "skipped";
-				bs.updated_at = new Date().toISOString();
-				syncTasks();
-				if (state.plan.tasks.some((t) => t.status === "pending")) {
-					pi.sendUserMessage("已跳过阻塞任务，继续执行下一项。", { deliverAs: "followUp" });
-				}
-			} else if (choice === "提供补充说明后重试") {
-				const instructions = await ctx.ui.editor("补充说明:", "");
-				if (instructions?.trim()) {
-					bs.status = "pending";
-					bs.notes = undefined;
+			while (true) {
+				const remaining = state.plan.tasks.filter((t) => t.status === "blocked");
+				if (remaining.length === 0) break;
+				const bs = remaining[0];
+				const countSuffix = remaining.length > 1 ? `  (还有 ${remaining.length - 1} 个阻塞任务)` : "";
+				const info = `Task ${bs.id}: ${bs.description}${bs.notes ? `\n原因: ${bs.notes}` : ""}${countSuffix}`;
+				const choice = await ctx.ui.select(`任务阻塞 — ${info}\n\n下一步?`, [
+					"跳过此任务",
+					"提供补充说明后重试",
+					"切回主会话重新规划",
+					"中止执行",
+				]);
+
+				if (choice === "跳过此任务") {
+					bs.status = "skipped";
 					bs.updated_at = new Date().toISOString();
+					skipCount++;
+				} else if (choice === "提供补充说明后重试") {
+					const instructions = await ctx.ui.editor("补充说明:", "");
+					if (instructions?.trim()) {
+						bs.status = "pending";
+						bs.notes = undefined;
+						bs.updated_at = new Date().toISOString();
+						retryInstructions.push(`Task ${bs.id} (${bs.description}): ${instructions.trim()}`);
+					} else {
+						// User canceled the editor — leave the task blocked and exit the loop,
+						// otherwise we spin forever on the same task.
+						break;
+					}
+				} else if (choice === "切回主会话重新规划") {
 					syncTasks();
-					pi.sendUserMessage(`重试 task ${bs.id}，补充说明: ${instructions.trim()}`, { deliverAs: "followUp" });
+					await handleReturn(ctx, `有任务阻塞: ${bs.description}。原因: ${bs.notes ?? "未知"}，需要重新规划。`);
+					returnedToParent = true;
+					break;
+				} else {
+					// 中止执行 or menu dismissed
+					aborted = true;
+					break;
 				}
-			} else if (choice === "切回主会话重新规划") {
-				await handleReturn(ctx, `有任务阻塞: ${bs.description}。原因: ${bs.notes ?? "未知"}，需要重新规划。`);
-			} else {
+			}
+
+			if (returnedToParent) return;
+
+			if (aborted) {
+				syncTasks();
 				await exitToNormal(state, pi, ctx);
 				updateUI(ctx);
 				persistState(ctx);
+				return;
+			}
+
+			syncTasks();
+			updateUI(ctx);
+			persistState(ctx);
+
+			// Only prod the executor when we actually changed something AND there's
+			// pending work left. If nothing happened (e.g. user canceled the editor)
+			// or there's no pending work, stay silent — saves an LLM turn.
+			const madeProgress = skipCount > 0 || retryInstructions.length > 0;
+			const hasPending = state.plan.tasks.some((t) => t.status === "pending");
+			if (madeProgress && hasPending) {
+				const parts: string[] = [];
+				if (retryInstructions.length > 0) {
+					parts.push(`重试说明:\n${retryInstructions.join("\n")}`);
+				}
+				if (skipCount > 0) {
+					parts.push(`已跳过 ${skipCount} 个阻塞任务。`);
+				}
+				parts.push("继续执行剩余任务。");
+				pi.sendUserMessage(parts.join("\n\n"), { deliverAs: "followUp" });
 			}
 			return;
 		}
@@ -827,7 +887,18 @@ export default function planExecute(pi: ExtensionAPI): void {
 			.pop();
 
 		if (saved?.data) {
-			Object.assign(state, saved.data);
+			// Whitelist restore — only fields that are meaningful across session
+			// restarts. Skips transient flags (e.g. userExited) that should reset
+			// each launch, and indices (executionStartIdx) that don't survive
+			// a new session anyway.
+			const d = saved.data as Partial<PlanExecuteState>;
+			if (typeof d.planEnabled === "boolean") state.planEnabled = d.planEnabled;
+			if (typeof d.executing === "boolean") state.executing = d.executing;
+			if (d.planDir !== undefined) state.planDir = d.planDir;
+			if (d.plan !== undefined) state.plan = d.plan;
+			if (d.parentSession !== undefined) state.parentSession = d.parentSession;
+			if (d.previousModel !== undefined) state.previousModel = d.previousModel;
+			if (d.previousThinking !== undefined) state.previousThinking = d.previousThinking;
 		}
 
 		// Check for exec-pending handoff (from planning session)

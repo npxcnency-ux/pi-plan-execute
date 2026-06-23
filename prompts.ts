@@ -80,7 +80,12 @@ export function buildExecPrompt(plan: PlanData): string {
 		})
 		.join("\n");
 
-	const nextTask = plan.tasks.find((t) => t.status === "pending");
+	const doneSet = new Set(
+		plan.tasks.filter((t) => t.status === "done" || t.status === "skipped").map((t) => t.id),
+	);
+	const nextTask = plan.tasks.find(
+		(t) => t.status === "pending" && t.depends_on.every((d) => doneSet.has(d)),
+	);
 
 	return `[EXEC MODE — 执行阶段]
 

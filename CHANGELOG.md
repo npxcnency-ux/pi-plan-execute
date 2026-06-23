@@ -2,6 +2,19 @@
 
 记录 plan-execute 扩展的 bug 与修复。最新在上。
 
+## 2026-06-23
+
+### Fixed
+- **`tasks.jsonl` 跨进程读半写**：`fs.writeFileSync` 是 `open/trunc → write* → close`，跨进程不原子。多 worker 并行执行时，`turn_end` 刷 widget 或兄弟 worker 调 `update_task` 可能读到空文件 / 截断 JSON。改用 atomic rename（写 `tasks.jsonl.<pid>.tmp` → `rename` 到目标），POSIX `rename` 在同 fs 内原子。
+  - 注意：仅解决"读半写"，**未解决两个 worker 同时 read-modify-write 时的丢更新**。个人单机场景窗口极窄、后果可恢复（下次 turn_end 重读），暂不上 `proper-lockfile`。
+- **session 文件被 `plan-execute-state` entry 撑大**：`persistState` 每轮无条件 `appendEntry`，session 文件 append-only，几个月下来旧条目堆积。加幂等守卫：用 `JSON.stringify(snapshot)` 比对 `lastPersistedKey`，状态未变直接 return。
+- **`.exec-pending.json` 异常残留导致下次 session 被误恢复**：`launchExecSession` 取消 / 抛错时 pending 文件仍在盘上，下次任意 `session_start` 都会读到它并强行进 exec 模式。修复：1) `readAndClearExecPending` 增加 5min TTL，过期直接丢弃；2) `launchExecSession` 的 cancelled 分支和 catch 分支都调 `clearExecPending`。
+- **`agent_end` 阻塞菜单只处理 `blocked[0]`**：多个 task 同时 blocked 时，剩余的要等下一轮 agent_end 才弹菜单 —— 中间 executor 空跑一轮浪费 token。改为 while 循环处理所有 blocked，循环内累积跳过数与重试说明，结束后一次性 `sendUserMessage` 通知 executor 继续。
+  - 边界：用户取消"补充说明"编辑器 → 任务保持 blocked，跳出循环，不发 followUp（避免假装"已跳过"误导 executor）。
+  - 边界：循环中选"切回主会话"或"中止执行" → 立即退出循环，剩余 blocked 保留状态等下次处理。
+- **`buildExecPrompt` 推荐的"next task"不看 `depends_on`**：原本 `tasks.find(t => t.status === "pending")` 返回第一个 pending，可能其依赖未完成。改为先建 `doneSet`（done + skipped）再 filter `depends_on.every(d => doneSet.has(d))`，找真正可立即开干的 task。
+- **`session_start` 用 `Object.assign(state, saved.data)` 全量恢复**：`userExited` 等本会话内临时标志会跨重启复活，历史上导致过 `/plan status` 看不见磁盘上的计划。改为白名单字段拷贝，只恢复跨会话有意义的 7 个字段，明确丢弃 `userExited` 和 `executionStartIdx`（后者在新 session 里索引会变，留着无意义）。
+
 ## 2026-06-16
 
 ### Fixed

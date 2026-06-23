@@ -50,7 +50,14 @@ export function readTasksJsonl(dir: string): { meta: PlanMeta; tasks: Task[] } |
 export function writeTasksJsonl(dir: string, meta: PlanMeta, tasks: Task[]): void {
 	fs.mkdirSync(dir, { recursive: true });
 	const lines = [JSON.stringify(meta), ...tasks.map((t) => JSON.stringify(t))];
-	fs.writeFileSync(tasksJsonlPath(dir), lines.join("\n") + "\n", "utf-8");
+	const target = tasksJsonlPath(dir);
+	// Atomic write: tmp file + rename. POSIX rename is atomic on the same fs,
+	// so concurrent readers (turn_end widget refresh, sibling worker) never
+	// see a half-written file. Does NOT prevent lost updates between two
+	// concurrent read-modify-write cycles — accept that for personal use.
+	const tmp = `${target}.${process.pid}.tmp`;
+	fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf-8");
+	fs.renameSync(tmp, target);
 }
 
 // ── HANDOFF.md ────────────────────────────────────────────────────────────────
@@ -102,17 +109,30 @@ export function writeExecPending(cwd: string, pending: ExecPending): void {
 	fs.writeFileSync(p, JSON.stringify(pending, null, 2), "utf-8");
 }
 
+// Stale handoff files (e.g. crashed mid-newSession) get dropped instead of
+// hijacking the next unrelated session_start.
+const EXEC_PENDING_TTL_MS = 5 * 60 * 1000;
+
 export function readAndClearExecPending(cwd: string): ExecPending | null {
 	const p = path.join(cwd, EXEC_PENDING_FILE);
 	if (!fs.existsSync(p)) return null;
 	try {
 		const data = JSON.parse(fs.readFileSync(p, "utf-8")) as ExecPending;
 		fs.unlinkSync(p);
+		const createdAt = Date.parse(data.createdAt);
+		if (Number.isFinite(createdAt) && Date.now() - createdAt > EXEC_PENDING_TTL_MS) {
+			return null;
+		}
 		return data;
 	} catch {
 		try { fs.unlinkSync(p); } catch { /* ignore */ }
 		return null;
 	}
+}
+
+export function clearExecPending(cwd: string): void {
+	const p = path.join(cwd, EXEC_PENDING_FILE);
+	try { fs.unlinkSync(p); } catch { /* ignore — likely already consumed */ }
 }
 
 // ── find in-progress plans ────────────────────────────────────────────────────
